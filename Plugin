@@ -1,0 +1,237 @@
+using HarmonyLib;
+using Rocket.API;
+using Rocket.Core.Plugins;
+using Rocket.Core.Utils;
+using SDG.Unturned;
+using Steamworks;
+using System;
+using System.Collections.Generic;
+
+namespace KRPNoExplosion
+{
+    public class Main : RocketPlugin<Configuration>
+    {
+        private Harmony _harmony;
+
+        // Словарь для хранения последних значений батареи
+        public static Dictionary<uint, ushort> LastBatteryValues = new Dictionary<uint, ushort>();
+
+        protected override void Load()
+        {
+            _harmony = new Harmony("com.krp.noexplosion");
+            _harmony.PatchAll();
+            Rocket.Core.Logging.Logger.Log("[KRPNoExplosion] Загружен | Машины не взрываются, HP не опускается ниже 1");
+        }
+
+        protected override void Unload()
+        {
+            _harmony?.UnpatchAll("com.krp.noexplosion");
+            Rocket.Core.Logging.Logger.Log("[KRPNoExplosion] Выгружен");
+        }
+    }
+
+
+    // 1. ПЕРВАЯ ЛОГИКА: Сохраняем батарею ТОЛЬКО при HP = 1 + мгновенная подмена
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("askDamage")]
+    internal class Patch_SaveAndRestoreBattery
+    {
+        private static void Prefix(InteractableVehicle __instance, ref ushort amount)
+        {
+            if (__instance == null) return;
+
+            ushort currentHealth = __instance.health;
+
+            if (currentHealth <= amount)
+            {
+                amount = (ushort)(currentHealth - 1);
+            }
+
+            if (__instance.health == 1)
+            {
+                // Проверяем, есть ли батарея в машине
+                if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                {
+                    // Сохраняем значение
+                    Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                }
+                else
+                {
+                    // Если батареи нет — удаляем сохранённое значение
+                    if (Main.LastBatteryValues.ContainsKey(__instance.instanceID))
+                    {
+                        Main.LastBatteryValues.Remove(__instance.instanceID);
+                    }
+                }
+
+                // Обнуляем батарею на сервере
+                __instance.batteryCharge = 0;
+                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+
+                // Если батарея была — подменяем на сохранённое значение
+                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                {
+                    __instance.batteryCharge = lastBattery;
+                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
+                }
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("checkEnter", new Type[] { typeof(CSteamID), typeof(CSteamID) })]
+    internal class Patch_BatteryOnCheckEnter
+    {
+        private static void Postfix(InteractableVehicle __instance, ref bool __result)
+        {
+            if (__instance == null) return;
+
+            if (__instance.health == 1 && __instance.batteryCharge > 0)
+            {
+                Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                __instance.batteryCharge = 0;
+                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("addPlayer")]
+    internal class Patch_RestoreBatteryOnEnter
+    {
+        private static void Prefix(InteractableVehicle __instance, byte seatIndex, CSteamID steamID)
+        {
+            if (__instance == null) return;
+
+            // Восстанавливаем батарею, когда игрок сел в машину
+            if (seatIndex == 0 && __instance.health == 1)
+            {
+                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                {
+                    __instance.batteryCharge = lastBattery;
+                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
+                    Main.LastBatteryValues.Remove(__instance.instanceID);
+                }
+            }
+        }
+    }
+
+    // 3 ТРЕТЬЯ ЛОГИКА: При пересадке на водительское место в разбитой машине
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("swapPlayer")]
+    internal class Patch_BatteryOnSwap
+    {
+        private static void Prefix(InteractableVehicle __instance, byte fromSeatIndex, byte toSeatIndex)
+        {
+            if (__instance == null) return;
+
+            // Только для разбитых машин (HP = 1)
+            if (__instance.health == 1)
+            {
+                // Если игрок пересаживается на пассажирское место (toSeatIndex > 0)
+                if (toSeatIndex > 0)
+                {
+                    // Сохраняем батарею (если есть)
+                    if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                    {
+                        Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                    }
+
+                    // Обнуляем батарею (пассажир не должен запускать двигатель)
+                    __instance.batteryCharge = 0;
+                    VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+                }
+                // Если игрок пересаживается на водительское место (toSeatIndex == 0)
+                else if (toSeatIndex == 0)
+                {
+                    // Восстанавливаем батарею (водитель может запустить двигатель)
+                    if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                    {
+                        __instance.batteryCharge = lastBattery;
+                        VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
+                        Main.LastBatteryValues.Remove(__instance.instanceID);
+                    }
+                    else
+                    {
+                        __instance.batteryCharge = 0;
+                        VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+                    }
+                }
+            }
+        }
+    }
+
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("tellHealth")]
+    internal class Patch_BlockOnHealthChange
+    {
+        private static void Postfix(InteractableVehicle __instance)
+        {
+            if (__instance == null) return;
+
+            // Если здоровье стало 1, блокируем управление
+            if (__instance.health == 1)
+            {
+                // Сохраняем батарею (если есть)
+                if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                {
+                    Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                }
+
+                // Обнуляем батарею (двигатель глохнет)
+                __instance.batteryCharge = 0;
+                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+
+                // Восстанавливаем батарею (UI не видит 0)
+                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                {
+                    __instance.batteryCharge = lastBattery;
+                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
+                }
+            }
+        }
+    }
+
+    // 3. ОЧИСТКА: Если батарею украли — удаляем сохранённое значение
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("stealBattery")]
+    internal class Patch_OnBatteryStolen
+    {
+        private static void Prefix(InteractableVehicle __instance)
+        {
+            if (__instance != null && Main.LastBatteryValues.ContainsKey(__instance.instanceID))
+            {
+                Main.LastBatteryValues.Remove(__instance.instanceID);
+            }
+        }
+    }
+
+    // 4. ОЧИСТКА: При удалении машины
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("OnDestroy")]
+    internal class Patch_CleanBatteryData
+    {
+        private static void Prefix(InteractableVehicle __instance)
+        {
+            if (__instance != null && Main.LastBatteryValues.ContainsKey(__instance.instanceID))
+            {
+                Main.LastBatteryValues.Remove(__instance.instanceID);
+            }
+        }
+    }
+
+    // Блокировка звука запуска двигателя при HP = 1
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("PlayIgnitionSound")]
+    internal class Patch_BlockIgnitionSound
+    {
+        private static bool Prefix(InteractableVehicle __instance)
+        {
+            if (__instance != null && __instance.health == 1)
+            {
+                return false;
+            }
+            return true;
+        }
+    }
+}
