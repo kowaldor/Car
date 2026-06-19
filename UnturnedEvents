@@ -1,0 +1,134 @@
+#region сборка Rocket.Unturned, Version=4.9.3.18, Culture=neutral, PublicKeyToken=null
+// C:\Users\Kowaldor\Desktop\Rocket.Unturned\Rocket.Unturned.dll
+// Decompiled with ICSharpCode.Decompiler 8.2.0.7535
+#endregion
+
+using System;
+using Rocket.API;
+using Rocket.API.Extensions;
+using Rocket.Core.Extensions;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using Steamworks;
+using UnityEngine;
+
+namespace Rocket.Unturned.Events;
+
+public sealed class UnturnedEvents : MonoBehaviour, IRocketImplementationEvents
+{
+    public delegate void PlayerDisconnected(UnturnedPlayer player);
+
+    public delegate void OnPlayerGetDamage(UnturnedPlayer player, ref EDeathCause cause, ref ELimb limb, ref UnturnedPlayer killer, ref Vector3 direction, ref float damage, ref float times, ref bool canDamage);
+
+    public delegate void PlayerConnected(UnturnedPlayer player);
+
+    private static UnturnedEvents Instance;
+
+    public event PlayerDisconnected OnPlayerDisconnected;
+
+    public static event OnPlayerGetDamage OnPlayerDamaged;
+
+    private event ImplementationShutdown onShutdown;
+
+    public event ImplementationShutdown OnShutdown
+    {
+        add
+        {
+            onShutdown += value;
+        }
+        remove
+        {
+            onShutdown -= value;
+        }
+    }
+
+    public event PlayerConnected OnPlayerConnected;
+
+    public event PlayerConnected OnBeforePlayerConnected;
+
+    private void Awake()
+    {
+        Instance = this;
+        Provider.onServerDisconnected = (Provider.ServerDisconnected)Delegate.Combine(Provider.onServerDisconnected, (Provider.ServerDisconnected)delegate (CSteamID r)
+        {
+            if (r != CSteamID.Nil)
+            {
+                this.OnPlayerDisconnected.TryInvoke(UnturnedPlayer.FromCSteamID(r));
+            }
+        });
+        Provider.onServerShutdown = (Provider.ServerShutdown)Delegate.Combine(Provider.onServerShutdown, (Provider.ServerShutdown)delegate
+        {
+            this.onShutdown.TryInvoke();
+        });
+        Provider.onServerConnected = (Provider.ServerConnected)Delegate.Combine(Provider.onServerConnected, (Provider.ServerConnected)delegate (CSteamID r)
+        {
+            if (r != CSteamID.Nil)
+            {
+                UnturnedPlayer unturnedPlayer3 = UnturnedPlayer.FromCSteamID(r);
+                unturnedPlayer3.Player.gameObject.TryAddComponent<UnturnedPlayerFeatures>();
+                unturnedPlayer3.Player.gameObject.TryAddComponent<UnturnedPlayerMovement>();
+                unturnedPlayer3.Player.gameObject.TryAddComponent<UnturnedPlayerEvents>();
+                this.OnBeforePlayerConnected.TryInvoke(unturnedPlayer3);
+            }
+        });
+        DamageTool.playerDamaged = (DamageToolPlayerDamagedHandler)Delegate.Combine(DamageTool.playerDamaged, (DamageToolPlayerDamagedHandler)delegate (SDG.Unturned.Player player, ref EDeathCause cause, ref ELimb limb, ref CSteamID killer, ref Vector3 direction, ref float damage, ref float times, ref bool canDamage)
+        {
+            if (UnturnedEvents.OnPlayerDamaged != null && player != null && killer != CSteamID.Nil)
+            {
+                UnturnedPlayer unturnedPlayer = UnturnedPlayer.FromPlayer(player);
+                UnturnedPlayer unturnedPlayer2 = UnturnedPlayer.FromCSteamID(killer);
+                UnturnedEvents.OnPlayerDamaged.TryInvoke(unturnedPlayer, cause, limb, unturnedPlayer2, direction, damage, times, canDamage);
+            }
+        });
+    }
+
+    internal static void triggerOnPlayerConnected(UnturnedPlayer player)
+    {
+        Instance.OnPlayerConnected.TryInvoke(player);
+    }
+}
+#if false // Журнал декомпиляции
+Элементов в кэше: "21"
+------------------
+Разрешить: "mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "mscorlib, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\mscorlib.dll"
+------------------
+Разрешить: "UnityEngine.CoreModule, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "UnityEngine.CoreModule, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Загрузить из: "D:\Steam\steamapps\common\Unturned\Unturned_Data\Managed\UnityEngine.CoreModule.dll"
+------------------
+Разрешить: "Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "Assembly-CSharp, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Загрузить из: "D:\Steam\steamapps\common\Unturned\Unturned_Data\Managed\Assembly-CSharp.dll"
+------------------
+Разрешить: "UnityEngine.PhysicsModule, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "UnityEngine.PhysicsModule, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Загрузить из: "D:\Steam\steamapps\common\Unturned\Unturned_Data\Managed\UnityEngine.PhysicsModule.dll"
+------------------
+Разрешить: "Rocket.API, Version=2.6.4.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "Rocket.API, Version=4.9.3.16, Culture=neutral, PublicKeyToken=null"
+Внимание! Несовпадение версий. Ожидалось: "2.6.4.0", получено: "4.9.3.16"
+Загрузить из: "C:\Users\Kowaldor\Desktop\Rocket.Unturned\Rocket.API.dll"
+------------------
+Разрешить: "Rocket.Core, Version=2.4.8.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "Rocket.Core, Version=4.9.3.16, Culture=neutral, PublicKeyToken=null"
+Внимание! Несовпадение версий. Ожидалось: "2.4.8.0", получено: "4.9.3.16"
+Загрузить из: "C:\Users\Kowaldor\Desktop\Rocket.Unturned\Rocket.Core.dll"
+------------------
+Разрешить: "com.rlabrecque.steamworks.net, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Найдена одна сборка: "com.rlabrecque.steamworks.net, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+Загрузить из: "D:\Steam\steamapps\common\Unturned\Unturned_Data\Managed\com.rlabrecque.steamworks.net.dll"
+------------------
+Разрешить: "System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System.Xml, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\System.Xml.dll"
+------------------
+Разрешить: "System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\System.dll"
+------------------
+Разрешить: "System.Core, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Найдена одна сборка: "System.Core, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089"
+Загрузить из: "C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8\System.Core.dll"
+#endif
