@@ -1,237 +1,1633 @@
 using HarmonyLib;
+using KRPCarKeys.Database;
 using Rocket.API;
 using Rocket.Core.Plugins;
-using Rocket.Core.Utils;
+using Rocket.Unturned.Player;
 using SDG.Unturned;
 using Steamworks;
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 
-namespace KRPNoExplosion
+namespace KRPCarKeys
 {
     public class Main : RocketPlugin<Configuration>
     {
+        public static Main Instance;
+        public static VehicleDatabase Database;
+
         private Harmony _harmony;
 
-        // Словарь для хранения последних значений батареи
-        public static Dictionary<uint, ushort> LastBatteryValues = new Dictionary<uint, ushort>();
+        public static readonly ushort[] KeyIds = { 58124, 58125, 58126, 58127, 58128, 58129, 58130, 58131 };
 
         protected override void Load()
         {
-            _harmony = new Harmony("com.krp.noexplosion");
+            Instance = this;
+            Database = new VehicleDatabase(Directory);
+
+            _harmony = new Harmony("com.krp.carkeys");
             _harmony.PatchAll();
-            Rocket.Core.Logging.Logger.Log("[KRPNoExplosion] Загружен | Машины не взрываются, HP не опускается ниже 1");
+
+            Provider.onServerDisconnected += OnServerDisconnected;
+
+            Rocket.Core.Logging.Logger.Log("[KRPCarKeys] Загружен!");
+        }
+
+        public ulong FindGuidByInstanceID(int instanceID)
+        {
+            return Database.GetGuidByInstanceID(instanceID);
+        }
+
+        private void CloseAllOpenVehicles()
+        {
+            int closedCount = 0;
+
+            foreach (var vehicle in VehicleManager.vehicles)
+            {
+                ulong guid = 0;
+                if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+                {
+                    guid = vehicle.lockedOwner.m_SteamID;
+                }
+                else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+                {
+                    guid = vehicle.lockedGroup.m_SteamID;
+                }
+
+                if (guid != 0) continue;
+
+                guid = FindGuidByInstanceID((int)vehicle.instanceID);
+                if (guid == 0) continue;
+
+                VehicleManager.ServerSetVehicleLock(vehicle, new CSteamID(guid), new CSteamID(guid), true);
+                closedCount++;
+            }
+
+            if (closedCount > 0)
+            {
+                Rocket.Core.Logging.Logger.Log($"[KRPCarKeys] Закрыто {closedCount} машин");
+            }
+        }
+
+        private void OnServerDisconnected(CSteamID steamID)
+        {
+            if (steamID == CSteamID.Nil) return;
+
+            string steamId = steamID.ToString();
+
+            List<(ushort itemId, ulong guid)> inventoryKeys = FindAllKeysInInventory(steamID);
+            List<ulong> inventoryGuids = new List<ulong>();
+            foreach (var invKey in inventoryKeys)
+            {
+                inventoryGuids.Add(invKey.guid);
+            }
+
+            var allData = Database.GetAll();
+            bool hasChanges = false;
+
+            foreach (var kvp in allData)
+            {
+                VehicleData data = kvp.Value;
+                bool needToRemove = false;
+
+                foreach (var keyData in data.keys)
+                {
+                    if (keyData.Owner == steamId)
+                    {
+                        needToRemove = true;
+                        break;
+                    }
+                }
+
+                if (!needToRemove) continue;
+
+                List<KeyData> keysToRemove = new List<KeyData>();
+                foreach (var keyData in data.keys)
+                {
+                    if (keyData.Owner != steamId) continue;
+
+                    if (!inventoryGuids.Contains(keyData.state))
+                    {
+                        keysToRemove.Add(keyData);
+                        hasChanges = true;
+                    }
+                }
+
+                foreach (var keyToRemove in keysToRemove)
+                {
+                    data.keys.Remove(keyToRemove);
+                }
+
+                if (data.keys.Count > 0)
+                {
+                    bool anyOwnerOnline = false;
+                    foreach (var keyData in data.keys)
+                    {
+                        if (keyData.Owner == steamId) continue;
+
+                        if (Provider.clients.Any(c => c.playerID.steamID.ToString() == keyData.Owner))
+                        {
+                            anyOwnerOnline = true;
+                            break;
+                        }
+                    }
+
+                    if (!anyOwnerOnline)
+                    {
+                        string vehicleName = data.vehicleName ?? "Транспорт";
+                        ulong guid = data.GUID;
+
+                        Task.Delay(60000).ContinueWith(_ =>
+                        {
+                            Rocket.Core.Utils.TaskDispatcher.QueueOnMainThread(() =>
+                            {
+                                SaveAndCloseVehicle(guid, vehicleName);
+                            });
+                        });
+                    }
+                }
+            }
+
+            if (hasChanges)
+            {
+                Database.ForceSaveAll();
+            }
+        }
+
+        private void SaveAndCloseVehicle(ulong guid, string vehicleName)
+        {
+            try
+            {
+                VehicleData checkData = Database.LoadVehicle(guid);
+                if (checkData != null && checkData.keys.Count > 0)
+                {
+                    bool anyOwnerOnline = false;
+                    foreach (var keyData in checkData.keys)
+                    {
+                        if (Provider.clients.Any(c => c.playerID.steamID.ToString() == keyData.Owner))
+                        {
+                            anyOwnerOnline = true;
+                            break;
+                        }
+                    }
+
+                    if (anyOwnerOnline)
+                    {
+                        return;
+                    }
+                }
+
+                InteractableVehicle targetVehicle = null;
+
+                foreach (var vehicle in VehicleManager.vehicles)
+                {
+                    ulong vehicleGuid = 0;
+                    if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+                    {
+                        vehicleGuid = vehicle.lockedOwner.m_SteamID;
+                    }
+                    else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+                    {
+                        vehicleGuid = vehicle.lockedGroup.m_SteamID;
+                    }
+
+                    if (vehicleGuid == guid)
+                    {
+                        targetVehicle = vehicle;
+                        break;
+                    }
+                }
+
+                if (targetVehicle == null)
+                {
+                    VehicleData data = Database.LoadVehicle(guid);
+                    if (data != null)
+                    {
+                        foreach (var vehicle in VehicleManager.vehicles)
+                        {
+                            if (data.instanceID == (int)vehicle.instanceID)
+                            {
+                                targetVehicle = vehicle;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (targetVehicle == null) return;
+
+                VehicleData saveData = Database.LoadVehicle(guid);
+                if (saveData == null)
+                {
+                    saveData = new VehicleData
+                    {
+                        GUID = guid,
+                        vehicleID = targetVehicle.asset?.id ?? 0,
+                        vehicleName = targetVehicle.asset?.FriendlyName ?? "Unknown"
+                    };
+                }
+
+                saveData.health = targetVehicle.health;
+                saveData.fuel = targetVehicle.fuel;
+                saveData.battery = targetVehicle.batteryCharge;
+                saveData.lastPosition = new Vector3Data
+                {
+                    x = targetVehicle.transform.position.x,
+                    y = targetVehicle.transform.position.y,
+                    z = targetVehicle.transform.position.z
+                };
+
+                if (targetVehicle.tires != null)
+                {
+                    saveData.wheels = new byte[targetVehicle.tires.Length];
+                    for (int i = 0; i < targetVehicle.tires.Length && i < 4; i++)
+                    {
+                        saveData.wheels[i] = (byte)(targetVehicle.tires[i].isAlive ? 1 : 0);
+                    }
+                }
+
+                saveData.instanceID = (int)targetVehicle.instanceID;
+                Database.SaveVehicle(saveData);
+
+                if (targetVehicle.isLocked == false)
+                {
+                    VehicleManager.ServerSetVehicleLock(targetVehicle, new CSteamID(guid), new CSteamID(guid), true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Rocket.Core.Logging.Logger.Log($"[ERROR] SaveAndCloseVehicle: {ex.Message}");
+            }
+        }
+
+        private List<(ushort itemId, ulong guid)> FindAllKeysInInventory(CSteamID steamID)
+        {
+            List<(ushort, ulong)> keys = new List<(ushort, ulong)>();
+            string mapName = Configuration.Instance?.MapName ?? "PEI";
+            string basePath = $"{ReadWrite.PATH}/Servers/Default/Players/{steamID}_";
+
+            for (int character = 0; character <= 4; character++)
+            {
+                string playerFolder = $"{basePath}{character}";
+                if (!System.IO.Directory.Exists(playerFolder)) continue;
+
+                string mapFolder = System.IO.Path.Combine(playerFolder, mapName);
+                if (!System.IO.Directory.Exists(mapFolder)) continue;
+
+                string inventoryPath = System.IO.Path.Combine(mapFolder, "Player", "Inventory.dat");
+                if (!System.IO.File.Exists(inventoryPath)) continue;
+
+                try
+                {
+                    byte[] inventoryData = System.IO.File.ReadAllBytes(inventoryPath);
+                    int offset = 1;
+
+                    for (byte page = 0; page < 9; page++)
+                    {
+                        if (offset + 2 >= inventoryData.Length) break;
+
+                        byte count = inventoryData[offset + 2];
+                        offset += 3;
+
+                        for (byte i = 0; i < count; i++)
+                        {
+                            if (offset + 8 >= inventoryData.Length) break;
+
+                            ushort itemId = BitConverter.ToUInt16(inventoryData, offset + 3);
+                            byte stateLength = inventoryData[offset + 7];
+                            offset += 8;
+
+                            if (stateLength >= 8 && offset + stateLength <= inventoryData.Length)
+                            {
+                                byte[] state = new byte[stateLength];
+                                Array.Copy(inventoryData, offset, state, 0, stateLength);
+                                offset += stateLength;
+
+                                if (Main.KeyIds.Contains(itemId))
+                                {
+                                    ulong guid = BitConverter.ToUInt64(state, 0);
+                                    if (Main.IsOurGUID(guid))
+                                    {
+                                        keys.Add((itemId, guid));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            return keys;
+        }
+
+        private void SaveAllVehicles()
+        {
+            int savedCount = 0;
+
+            foreach (var vehicle in VehicleManager.vehicles)
+            {
+                ulong guid = 0;
+                if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+                {
+                    guid = vehicle.lockedOwner.m_SteamID;
+                }
+                else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+                {
+                    guid = vehicle.lockedGroup.m_SteamID;
+                }
+
+                if (guid == 0) continue;
+
+                VehicleData data = Main.Database.LoadVehicle(guid);
+                if (data == null)
+                {
+                    data = new VehicleData
+                    {
+                        GUID = guid,
+                        vehicleID = vehicle.asset?.id ?? 0,
+                        vehicleName = vehicle.asset?.FriendlyName ?? "Unknown"
+                    };
+                }
+
+                data.health = vehicle.health;
+                data.fuel = vehicle.fuel;
+                data.battery = vehicle.batteryCharge;
+                data.lastPosition = new Vector3Data
+                {
+                    x = vehicle.transform.position.x,
+                    y = vehicle.transform.position.y,
+                    z = vehicle.transform.position.z
+                };
+
+                if (vehicle.tires != null)
+                {
+                    data.wheels = new byte[vehicle.tires.Length];
+                    for (int i = 0; i < vehicle.tires.Length && i < 4; i++)
+                    {
+                        data.wheels[i] = (byte)(vehicle.tires[i].isAlive ? 1 : 0);
+                    }
+                }
+
+                Main.Database.SaveVehicle(data);
+                savedCount++;
+            }
+
+            Rocket.Core.Logging.Logger.Log($"[KRPCarKeys] Сохранено {savedCount} машин");
         }
 
         protected override void Unload()
         {
-            _harmony?.UnpatchAll("com.krp.noexplosion");
-            Rocket.Core.Logging.Logger.Log("[KRPNoExplosion] Выгружен");
+            Provider.onServerDisconnected -= OnServerDisconnected;
+
+            CloseAllOpenVehicles();
+            SaveAllVehicles();
+
+            _harmony?.UnpatchAll("com.krp.carkeys");
+
+            Database?.ForceSaveAll();
+
+            Rocket.Core.Logging.Logger.Log("[KRPCarKeys] Выгружен");
+        }
+
+        public static ulong GenerateGUID()
+        {
+            System.Random random = new System.Random();
+            return (ulong)random.Next(1000000, 999999999);
+        }
+
+        public static bool IsOurGUID(ulong id)
+        {
+            return id >= 1000000 && id <= 999999999;
         }
     }
+}
 
+using Rocket.API;
 
-    // 1. ПЕРВАЯ ЛОГИКА: Сохраняем батарею ТОЛЬКО при HP = 1 + мгновенная подмена
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("askDamage")]
-    internal class Patch_SaveAndRestoreBattery
+namespace KRPCarKeys
+{
+    public class Configuration : IRocketPluginConfiguration
     {
-        private static void Prefix(InteractableVehicle __instance, ref ushort amount)
+        public bool EnableVehicleBlacklist { get; set; } = false;
+        public string MapName { get; set; } = "PEI";
+
+        public void LoadDefaults()
         {
-            if (__instance == null) return;
+            MapName = "PEI";
+        }
+    }
+}
 
-            ushort currentHealth = __instance.health;
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using Steamworks;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
 
-            if (currentHealth <= amount)
+namespace KRPCarKeys.Commands
+{
+    public class CommandCarGPS : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "car";
+        public string Help => "Для использования GPS маркера используйте команду: /car gps";
+        public string Syntax => "gps";
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "krpcarkeys.user" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            if (command.Length == 0 || command[0].ToLower() != "gps")
             {
-                amount = (ushort)(currentHealth - 1);
+                UnturnedChat.Say(caller, "Использование: /car gps");
+                return;
             }
 
-            if (__instance.health == 1)
+            ushort itemId = player.Player.equipment.itemID;
+            byte[] state = player.Player.equipment.state;
+
+            if (!Main.KeyIds.Contains(itemId) || state == null || state.Length < 8)
             {
-                // Проверяем, есть ли батарея в машине
-                if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                UnturnedChat.Say(caller, "Возьмите ключ в руки!");
+                return;
+            }
+
+            ulong guid = BitConverter.ToUInt64(state, 0);
+            if (!Main.IsOurGUID(guid))
+            {
+                UnturnedChat.Say(caller, "Ключ поврежден!");
+                return;
+            }
+
+            InteractableVehicle targetVehicle = null;
+            string vehicleName = "Транспорт";
+
+            foreach (var vehicle in VehicleManager.vehicles)
+            {
+                ulong vehicleGuid = 0;
+                if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
                 {
-                    // Сохраняем значение
-                    Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                    vehicleGuid = vehicle.lockedOwner.m_SteamID;
+                }
+                else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+                {
+                    vehicleGuid = vehicle.lockedGroup.m_SteamID;
+                }
+
+                if (vehicleGuid == guid)
+                {
+                    targetVehicle = vehicle;
+                    vehicleName = vehicle.asset?.FriendlyName ?? "Транспорт";
+                    break;
+                }
+            }
+
+            if (targetVehicle == null)
+            {
+                UnturnedChat.Say(caller, "Машина не найдена в мире!");
+                return;
+            }
+
+            player.Player.quests.replicateSetMarker(true, targetVehicle.transform.position, vehicleName);
+            UnturnedChat.Say(caller, $"GPS маркер '{vehicleName}' добавлен на карту!");
+        }
+    }
+}
+
+using System.Collections.Generic;
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using UnityEngine;
+using KRPCarKeys.Database;
+
+namespace KRPCarKeys.Commands
+{
+    public class CommandCarInfo : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "carinfo";
+        public string Help => "Показывает информацию о транспорте";
+        public string Syntax => "";
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "krpcarkeys.admin" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            Vector3 origin = player.Player.look.aim.position - player.Player.look.aim.forward * 0.5f;
+            Vector3 direction = player.Player.look.aim.forward;
+            float distance = 4f;
+            int layerMask = RayMasks.VEHICLE;
+
+            RaycastHit hit;
+            if (!Physics.Raycast(origin, direction, out hit, distance, layerMask))
+            {
+                UnturnedChat.Say(caller, "Смотрите на транспорт!");
+                return;
+            }
+
+            InteractableVehicle vehicle = hit.transform.GetComponent<InteractableVehicle>();
+            if (vehicle == null)
+            {
+                return;
+            }
+
+            // Ищем GUID в полях машины
+            ulong guid = 0;
+            if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+            {
+                guid = vehicle.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+            {
+                guid = vehicle.lockedGroup.m_SteamID;
+            }
+
+            // Если GUID не найден в полях — ищем в БД по instanceID
+            if (guid == 0)
+            {
+                var allData = Main.Database.GetAll();
+                foreach (var kvp in allData)
+                {
+                    if (kvp.Value.instanceID == (int)vehicle.instanceID)
+                    {
+                        guid = kvp.Key;
+                        break;
+                    }
+                }
+            }
+
+            string vehicleName = vehicle.asset?.FriendlyName ?? "Unknown";
+            ushort vehicleId = vehicle.asset?.id ?? 0;
+
+            if (guid != 0)
+            {
+                UnturnedChat.Say(caller, $"ID: {vehicleId} | Название: {vehicleName} | instanceID: {vehicle.instanceID} | GUID: {guid}");
+            }
+            else
+            {
+                UnturnedChat.Say(caller, $"ID: {vehicleId} | Название: {vehicleName} | instanceID: {vehicle.instanceID} | GUID не найден");
+            }
+        }
+    }
+}
+
+using KRPCarKeys.Database;
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using Steamworks;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using UnityEngine;
+
+namespace KRPCarKeys.Commands
+{
+    public class CommandCarMakeKey : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "car";
+        public string Help => "Для создания дубликата ключа используйте: /car makekey, держа ключ-болванку в руке и смотря на машину";
+        public string Syntax => "makekey";
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "krpcarkeys.user" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            if (command.Length == 0 || command[0].ToLower() != "makekey")
+            {
+                UnturnedChat.Say(caller, "Использование: /car makekey");
+                return;
+            }
+
+            ushort itemId = player.Player.equipment.itemID;
+            if (itemId != 58132)
+            {
+                UnturnedChat.Say(caller, "Возьмите ключ-болванку в руку!");
+                return;
+            }
+
+            Vector3 origin = player.Player.look.aim.position - player.Player.look.aim.forward * 0.5f;
+            Vector3 direction = player.Player.look.aim.forward;
+            float distance = 4f;
+            int layerMask = RayMasks.VEHICLE;
+
+            RaycastHit hit;
+            if (!Physics.Raycast(origin, direction, out hit, distance, layerMask))
+            {
+                UnturnedChat.Say(caller, "Смотрите на транспорт!");
+                return;
+            }
+
+            InteractableVehicle targetVehicle = hit.transform.GetComponent<InteractableVehicle>();
+            if (targetVehicle == null)
+            {
+                UnturnedChat.Say(caller, "Это не транспорт!");
+                return;
+            }
+
+            ulong vehicleGuid = 0;
+            if (Main.IsOurGUID(targetVehicle.lockedOwner.m_SteamID))
+            {
+                vehicleGuid = targetVehicle.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(targetVehicle.lockedGroup.m_SteamID))
+            {
+                vehicleGuid = targetVehicle.lockedGroup.m_SteamID;
+            }
+
+            if (vehicleGuid == 0)
+            {
+                vehicleGuid = Main.Instance.FindGuidByInstanceID((int)targetVehicle.instanceID);
+            }
+
+            if (vehicleGuid == 0)
+            {
+                UnturnedChat.Say(caller, "Этот транспорт не имеет ключа!");
+                return;
+            }
+
+            // Проверяем, есть ли у игрока ключ от этой машины в инвентаре
+            bool hasKey = false;
+            for (byte page = 0; page < player.Player.inventory.items.Length; page++)
+            {
+                var items = player.Player.inventory.items[page];
+                if (items == null) continue;
+
+                var itemList = items.items;
+                if (itemList == null) continue;
+
+                for (int i = 0; i < itemList.Count; i++)
+                {
+                    ItemJar jar = itemList[i];
+                    if (jar == null || jar.item == null) continue;
+                    if (!Main.KeyIds.Contains(jar.item.id)) continue;
+                    if (jar.item.state == null || jar.item.state.Length < 8) continue;
+
+                    ulong keyGuid = BitConverter.ToUInt64(jar.item.state, 0);
+                    if (keyGuid == vehicleGuid)
+                    {
+                        hasKey = true;
+                        break;
+                    }
+                }
+                if (hasKey) break;
+            }
+
+            if (!hasKey)
+            {
+                UnturnedChat.Say(caller, "У вас нет ключа от этого транспорта!");
+                return;
+            }
+
+            // Удаляем болванку
+            bool removed = false;
+            for (byte page = 0; page < player.Player.inventory.items.Length; page++)
+            {
+                var items = player.Player.inventory.items[page];
+                if (items == null) continue;
+
+                var itemList = items.items;
+                if (itemList == null) continue;
+
+                for (int i = 0; i < itemList.Count; i++)
+                {
+                    ItemJar jar = itemList[i];
+                    if (jar != null && jar.item.id == 58132)
+                    {
+                        player.Player.inventory.removeItem(page, (byte)i);
+                        removed = true;
+                        break;
+                    }
+                }
+                if (removed) break;
+            }
+
+            if (!removed)
+            {
+                UnturnedChat.Say(caller, "Ошибка! Ключ-болванка не найдена в инвентаре.");
+                return;
+            }
+
+            // Создаём новый ключ
+            ushort newKeyId = Main.KeyIds[new System.Random().Next(Main.KeyIds.Length)];
+            byte[] keyData = BitConverter.GetBytes(vehicleGuid);
+            Item keyItem = new Item(newKeyId, 1, 100, keyData);
+
+            string vehicleName = targetVehicle.asset?.FriendlyName ?? "Транспорт";
+
+            if (player.Player.inventory.tryAddItem(keyItem, true))
+            {
+                UnturnedChat.Say(caller, $"Дубликат ключа от '{vehicleName}' создан!");
+            }
+            else
+            {
+                Vector3 spawnPosition = player.Player.transform.position + new Vector3(0f, 0.5f, 0f);
+                ItemManager.dropItem(keyItem, spawnPosition, playEffect: true, isDropped: true, wideSpread: false);
+                UnturnedChat.Say(caller, $"Дубликат ключа от '{vehicleName}' создан!");
+            }
+        }
+    }
+}
+
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace KRPCarKeys.Commands
+{
+    public class CommandParkEnter : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "parkenter";
+        public string Help => "Вход в закрытый транспорт";
+        public string Syntax => "";
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "krpcarkeys.parkenter" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            // Рейкаст с коррекцией (луч позади игрока)
+            Vector3 origin = player.Player.look.aim.position - player.Player.look.aim.forward * 0.5f;
+            Vector3 direction = player.Player.look.aim.forward;
+            float distance = 4f;
+
+            // Используем маску только для машин (слой 13)
+            int layerMask = RayMasks.VEHICLE; // 67108864
+
+            RaycastHit hit;
+            if (!Physics.Raycast(origin, direction, out hit, distance, layerMask))
+            {
+                UnturnedChat.Say(caller, "Смотрите на транспорт!");
+                return;
+            }
+
+            InteractableVehicle vehicle = hit.transform.GetComponent<InteractableVehicle>();
+            if (vehicle == null)
+            {
+                return;
+            }
+
+            // Проверяем, есть ли места в машине
+            if (vehicle.passengers == null || vehicle.passengers.Length == 0)
+            {
+                UnturnedChat.Say(caller, "В этом транспорте нет мест!");
+                return;
+            }
+
+            // Проверяем, занято ли водительское место
+            if (vehicle.passengers[0].player != null)
+            {
+                if (vehicle.passengers[0].player.playerID.steamID == player.CSteamID)
+                {
+                    VehicleManager.forceRemovePlayer(vehicle, player.CSteamID);
                 }
                 else
                 {
-                    // Если батареи нет — удаляем сохранённое значение
-                    if (Main.LastBatteryValues.ContainsKey(__instance.instanceID))
+                    UnturnedChat.Say(caller, "Водительское место занято другим игроком!");
+                    return;
+                }
+            }
+
+            // Принудительная синхронизация перед посадкой
+            VehicleManager.ServerSetVehicleLock(vehicle, vehicle.lockedOwner, vehicle.lockedGroup, false);
+            VehicleManager.ServerSetVehicleLock(vehicle, vehicle.lockedOwner, vehicle.lockedGroup, true);
+
+            // Сажаем игрока за руль
+            VehicleManager.ServerForcePassengerIntoVehicle(player.Player, vehicle);
+
+            UnturnedChat.Say(caller, "Вы сели в транспорт!");
+        }
+    }
+}
+
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using Steamworks;
+using System;
+using System.Collections.Generic;
+using UnityEngine;
+using KRPCarKeys.Database;
+
+namespace KRPCarKeys.Commands
+{
+    public class CommandV : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "vehicle";
+        public string Help => "Создаёт транспорт и ключ к нему!";
+        public string Syntax => "<id или название>";
+        public List<string> Aliases => new List<string> { "v" };
+        public List<string> Permissions => new List<string> { "krpcarkeys.admin" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            if (command.Length == 0)
+            {
+                UnturnedChat.Say(caller, "Использование: /v <id или название>");
+                return;
+            }
+
+            ushort? vehicleId = null;
+            string search = command[0];
+
+            if (ushort.TryParse(search, out ushort id))
+            {
+                vehicleId = id;
+            }
+            else
+            {
+                List<VehicleAsset> assets = new List<VehicleAsset>();
+                Assets.find(assets);
+
+                foreach (VehicleAsset asset in assets)
+                {
+                    if (asset != null && asset.FriendlyName != null &&
+                        asset.FriendlyName.ToLower().Contains(search.ToLower()))
                     {
-                        Main.LastBatteryValues.Remove(__instance.instanceID);
+                        vehicleId = asset.id;
+                        break;
+                    }
+                }
+            }
+
+            if (!vehicleId.HasValue)
+            {
+                UnturnedChat.Say(caller, $"Транспорт '{search}' не найден!");
+                return;
+            }
+
+            VehicleTool.giveVehicle(player.Player, vehicleId.Value);
+
+            InteractableVehicle vehicle = null;
+            var vehicles = VehicleManager.vehicles;
+            if (vehicles.Count > 0)
+            {
+                vehicle = vehicles[vehicles.Count - 1];
+            }
+
+            if (vehicle == null)
+            {
+                UnturnedChat.Say(caller, "Ошибка: Транспорт не найден!");
+                return;
+            }
+
+            ulong vehicleGuid = Main.GenerateGUID();
+
+            VehicleManager.ServerSetVehicleLock(vehicle, new CSteamID(vehicleGuid), new CSteamID(vehicleGuid), true);
+
+            ushort keyId = Main.KeyIds[new System.Random().Next(Main.KeyIds.Length)];
+            byte[] keyData = BitConverter.GetBytes(vehicleGuid);
+            Item keyItem = new Item(keyId, 1, 100, keyData);
+
+            List<VehicleAsset> allAssets = new List<VehicleAsset>();
+            Assets.find(allAssets);
+            string vehicleName = "Unknown";
+            foreach (VehicleAsset asset in allAssets)
+            {
+                if (asset.id == vehicleId.Value)
+                {
+                    vehicleName = asset.FriendlyName;
+                    break;
+                }
+            }
+
+            VehicleData data = new VehicleData
+            {
+                GUID = vehicleGuid,
+                vehicleID = vehicleId.Value,
+                vehicleName = vehicleName,
+                instanceID = (int)vehicle.instanceID
+            };
+
+            data.keys.Add(new KeyData
+            {
+                ID = keyId,
+                Owner = player.CSteamID.ToString(),
+                state = vehicleGuid
+            });
+
+            Main.Database.SaveVehicle(data);
+
+            if (player.Player.inventory.tryAddItem(keyItem, true))
+            {
+                UnturnedChat.Say(caller, $"Транспорт '{vehicleName}' создан! Ключ выдан! GUID: {vehicleGuid}");
+            }
+            else
+            {
+                Vector3 spawnPosition = player.Player.transform.position + new Vector3(0f, 0.5f, 0f);
+                ItemManager.dropItem(keyItem, spawnPosition, playEffect: true, isDropped: true, wideSpread: false);
+                UnturnedChat.Say(caller, $"Транспорт '{vehicleName}' создан! Ключ выдан! GUID: {vehicleGuid}");
+            }
+        }
+    }
+}
+
+using System.Collections.Generic;
+using Rocket.API;
+using Rocket.Unturned.Chat;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using UnityEngine;
+using KRPCarKeys.Database;
+
+namespace KRPCarKeys.Commands
+{
+    public class CommandVD : IRocketCommand
+    {
+        public AllowedCaller AllowedCaller => AllowedCaller.Player;
+        public string Name => "vehicledestroy";
+        public string Help => "Удаляет транспорт, на который смотришь";
+        public string Syntax => "";
+        public List<string> Aliases => new List<string> { "vd" };
+        public List<string> Permissions => new List<string> { "krpcarkeys.admin" };
+
+        public void Execute(IRocketPlayer caller, string[] command)
+        {
+            UnturnedPlayer player = (UnturnedPlayer)caller;
+
+            Vector3 origin = player.Player.look.aim.position - player.Player.look.aim.forward * 0.5f;
+            Vector3 direction = player.Player.look.aim.forward;
+            float distance = 4f;
+
+            int layerMask = RayMasks.VEHICLE;
+
+            RaycastHit hit;
+            if (!Physics.Raycast(origin, direction, out hit, distance, layerMask))
+            {
+                UnturnedChat.Say(caller, "Смотрите на транспорт!");
+                return;
+            }
+
+            InteractableVehicle vehicle = hit.transform.GetComponent<InteractableVehicle>();
+            if (vehicle == null)
+            {
+                return;
+            }
+
+            // Проверка: есть ли кто-то в машине
+            if (vehicle.passengers != null)
+            {
+                foreach (Passenger passenger in vehicle.passengers)
+                {
+                    if (passenger != null && passenger.player != null)
+                    {
+                        UnturnedChat.Say(caller, "Нельзя удалить транспорт с игроком внутри!");
+                        return;
+                    }
+                }
+            }
+
+            // ==========================================
+            // 1. Ищем GUID в полях машины
+            // ==========================================
+            ulong guid = 0;
+            if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+            {
+                guid = vehicle.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+            {
+                guid = vehicle.lockedGroup.m_SteamID;
+            }
+
+            // ==========================================
+            // 2. Если не нашли — ищем в БД по instanceID
+            // ==========================================
+            if (guid == 0)
+            {
+                guid = Main.Instance.FindGuidByInstanceID((int)vehicle.instanceID);
+            }
+
+            // ==========================================
+            // 3. Если GUID найден — удаляем из БД
+            // ==========================================
+            if (guid != 0)
+            {
+                Main.Database.DeleteVehicle(guid);
+            }
+
+            // Эффекты при удалении (ID 19, 69, 138)
+            Vector3 position = vehicle.transform.position;
+
+            EffectAsset effect19 = Assets.find(EAssetType.EFFECT, 19) as EffectAsset;
+            EffectAsset effect69 = Assets.find(EAssetType.EFFECT, 69) as EffectAsset;
+            EffectAsset effect138 = Assets.find(EAssetType.EFFECT, 138) as EffectAsset;
+
+            if (effect19 != null)
+            {
+                TriggerEffectParameters parameters = new TriggerEffectParameters(effect19);
+                parameters.position = position;
+                parameters.relevantDistance = EffectManager.LARGE;
+                parameters.reliable = true;
+                EffectManager.triggerEffect(parameters);
+            }
+
+            if (effect69 != null)
+            {
+                TriggerEffectParameters parameters = new TriggerEffectParameters(effect69);
+                parameters.position = position;
+                parameters.relevantDistance = EffectManager.LARGE;
+                parameters.reliable = true;
+                EffectManager.triggerEffect(parameters);
+            }
+
+            if (effect138 != null)
+            {
+                TriggerEffectParameters parameters = new TriggerEffectParameters(effect138);
+                parameters.position = position;
+                parameters.relevantDistance = EffectManager.LARGE;
+                parameters.reliable = true;
+                EffectManager.triggerEffect(parameters);
+            }
+
+            VehicleManager.askVehicleDestroy(vehicle);
+            UnturnedChat.Say(caller, $"Транспорт {vehicle.asset?.FriendlyName ?? "Unknown"} удален!");
+        }
+    }
+}
+
+using System.Collections.Generic;
+using Newtonsoft.Json;
+
+namespace KRPCarKeys.Database
+{
+    public class VehicleData
+    {
+        [JsonProperty("GUID")]
+        public ulong GUID { get; set; }
+
+        [JsonProperty("vehicleID")]
+        public ushort vehicleID { get; set; }
+
+        [JsonProperty("vehicleName")]
+        public string vehicleName { get; set; }
+
+        // === Временный ID для связи с игрой ===
+        [JsonProperty("instanceID")]
+        public int instanceID { get; set; }
+
+        // === Владелец (для будущего) ===
+        [JsonProperty("steamID")]
+        public string steamID { get; set; }
+
+        [JsonProperty("licensePlate")]
+        public string licensePlate { get; set; }
+
+        // === Состояние машины ===
+        [JsonProperty("health")]
+        public ushort health { get; set; }
+
+        [JsonProperty("battery")]
+        public ushort battery { get; set; }
+
+        [JsonProperty("fuel")]
+        public ushort fuel { get; set; }
+
+        [JsonProperty("wheels")]
+        public byte[] wheels { get; set; }
+
+        [JsonProperty("lastPosition")]
+        public Vector3Data lastPosition { get; set; }
+
+        [JsonProperty("baggage")]
+        public List<ItemData> baggage { get; set; }
+
+        // === Ключи (отдельная таблица) ===
+        [JsonProperty("keys")]
+        public List<KeyData> keys { get; set; }
+
+        public VehicleData()
+        {
+            baggage = new List<ItemData>();
+            wheels = new byte[4];
+            keys = new List<KeyData>();
+            steamID = "";
+            licensePlate = "";
+            instanceID = 0;
+        }
+    }
+
+    public class Vector3Data
+    {
+        public float x { get; set; }
+        public float y { get; set; }
+        public float z { get; set; }
+    }
+
+    public class ItemData
+    {
+        public ushort itemID { get; set; }
+        public byte amount { get; set; }
+        public byte quality { get; set; }
+        public byte[] state { get; set; }
+    }
+
+    // === Класс для ключей ===
+    public class KeyData
+    {
+        [JsonProperty("ID")]
+        public ushort ID { get; set; }
+
+        [JsonProperty("Owner")]
+        public string Owner { get; set; }
+
+        [JsonProperty("state")]
+        public ulong state { get; set; }
+
+        public KeyData()
+        {
+            Owner = "";
+            state = 0;
+        }
+    }
+}
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using Newtonsoft.Json;
+
+namespace KRPCarKeys.Database
+{
+    public class VehicleDatabase
+    {
+        private readonly string filePath;
+        private Dictionary<ulong, VehicleData> _cache;
+        private readonly object _lock = new object();
+
+        public VehicleDatabase(string pluginDirectory)
+        {
+            filePath = Path.Combine(pluginDirectory, "vehicles.json");
+            _cache = new Dictionary<ulong, VehicleData>();
+            LoadAll();
+        }
+
+        public void LoadAll()
+        {
+            lock (_lock)
+            {
+                if (!File.Exists(filePath))
+                {
+                    _cache = new Dictionary<ulong, VehicleData>();
+                    return;
+                }
+
+                try
+                {
+                    string json = File.ReadAllText(filePath);
+                    _cache = JsonConvert.DeserializeObject<Dictionary<ulong, VehicleData>>(json)
+                           ?? new Dictionary<ulong, VehicleData>();
+                }
+                catch (Exception ex)
+                {
+                    Rocket.Core.Logging.Logger.Log($"[ERROR] LoadAll: {ex.Message}");
+                    _cache = new Dictionary<ulong, VehicleData>();
+                }
+            }
+        }
+
+        public VehicleData LoadVehicle(ulong guid)
+        {
+            lock (_lock)
+            {
+                return _cache.TryGetValue(guid, out VehicleData data) ? data : null;
+            }
+        }
+
+        public void SaveVehicle(VehicleData data)
+        {
+            if (data == null) return;
+
+            lock (_lock)
+            {
+                _cache[data.GUID] = data;
+                SaveAll();
+            }
+        }
+
+        public void DeleteVehicle(ulong guid)
+        {
+            lock (_lock)
+            {
+                if (_cache.Remove(guid))
+                {
+                    SaveAll();
+                }
+            }
+        }
+
+        private void SaveAll()
+        {
+            try
+            {
+                string json = JsonConvert.SerializeObject(_cache, Formatting.Indented);
+                File.WriteAllText(filePath, json);
+            }
+            catch (Exception ex)
+            {
+                Rocket.Core.Logging.Logger.Log($"[ERROR] SaveAll: {ex.Message}");
+            }
+        }
+
+        public void ForceSaveAll()
+        {
+            lock (_lock)
+            {
+                SaveAll();
+            }
+        }
+
+        public Dictionary<ulong, VehicleData> GetAll()
+        {
+            lock (_lock)
+            {
+                return new Dictionary<ulong, VehicleData>(_cache);
+            }
+        }
+
+        // 🔥 НОВЫЙ МЕТОД: Поиск GUID по instanceID без копирования словаря
+        public ulong GetGuidByInstanceID(int instanceID)
+        {
+            lock (_lock)
+            {
+                foreach (var kvp in _cache)
+                {
+                    if (kvp.Value.instanceID == instanceID)
+                    {
+                        return kvp.Key;
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+}
+
+using HarmonyLib;
+using SDG.Unturned;
+using Steamworks;
+using KRPCarKeys.Database;
+using UnityEngine;
+
+namespace KRPCarKeys.Patches
+{
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("removePlayer")]
+    internal class Patch_OnPlayerExit
+    {
+        private static void Prefix(InteractableVehicle __instance, byte seatIndex, Vector3 point, byte angle, bool forceUpdate)
+        {
+            if (__instance == null) return;
+
+            // Ищем GUID в полях машины
+            ulong guid = 0;
+            if (Main.IsOurGUID(__instance.lockedOwner.m_SteamID))
+            {
+                guid = __instance.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(__instance.lockedGroup.m_SteamID))
+            {
+                guid = __instance.lockedGroup.m_SteamID;
+            }
+
+            if (guid == 0) return;
+
+            // 🔥 Принудительная синхронизация после высадки
+            if (__instance.isLocked && guid != 0)
+            {
+                VehicleManager.ServerSetVehicleLock(__instance, __instance.lockedOwner, __instance.lockedGroup, false);
+                VehicleManager.ServerSetVehicleLock(__instance, __instance.lockedOwner, __instance.lockedGroup, true);
+            }
+        }
+    }
+}
+
+using HarmonyLib;
+using SDG.Unturned;
+using Steamworks;
+using KRPCarKeys.Database;
+
+namespace KRPCarKeys.Patches
+{
+    [HarmonyPatch(typeof(InteractableVehicle))]
+    [HarmonyPatch("tellLocked")]
+    internal class Patch_TellLocked
+    {
+        private static bool Prefix(InteractableVehicle __instance, ref CSteamID owner, ref CSteamID group, ref bool locked)
+        {
+            // 1. Ищем GUID в полях машины
+            ulong currentGuid = 0;
+            if (Main.IsOurGUID(__instance.lockedOwner.m_SteamID))
+            {
+                currentGuid = __instance.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(__instance.lockedGroup.m_SteamID))
+            {
+                currentGuid = __instance.lockedGroup.m_SteamID;
+            }
+
+            // 2. Если GUID нет — ищем в БД по instanceID
+            if (currentGuid == 0)
+            {
+                currentGuid = Main.Instance.FindGuidByInstanceID((int)__instance.instanceID);
+            }
+
+            // 3. Если GUID нет — выходим (машина без ключа)
+            if (currentGuid == 0)
+            {
+                return true;
+            }
+
+            // 4. ОТКРЫТИЕ МАШИНЫ
+            if (!locked)
+            {
+                owner = CSteamID.Nil;
+                group = CSteamID.Nil;
+                locked = false;
+                return true;
+            }
+
+            // 5. ЗАКРЫТИЕ МАШИНЫ — ВСЕГДА используем GUID
+            if (locked)
+            {
+                owner = new CSteamID(currentGuid);
+                group = new CSteamID(currentGuid);
+                locked = true;
+                return true;
+            }
+
+            return true;
+        }
+    }
+}
+
+using HarmonyLib;
+using KRPCarKeys.Database;
+using Rocket.Unturned.Player;
+using SDG.Unturned;
+using Steamworks;
+using System;
+using System.Linq;
+using UnityEngine;
+
+namespace KRPCarKeys.Patches
+{
+    [HarmonyPatch(typeof(PlayerLife))]
+    [HarmonyPatch("askEat")]
+    internal class Patch_UseKey
+    {
+        private static void Prefix(PlayerLife __instance, byte amount)
+        {
+            if (__instance == null || __instance.player == null) return;
+
+            Player player = __instance.player;
+            if (player == null) return;
+
+            PlayerEquipment equipment = player.equipment;
+            if (equipment == null) return;
+
+            ushort itemId = equipment.itemID;
+            if (!Main.KeyIds.Contains(itemId))
+            {
+                return;
+            }
+
+            CSteamID steamID = player.channel.owner.playerID.steamID;
+            UnturnedPlayer unturnedPlayer = UnturnedPlayer.FromCSteamID(steamID);
+            if (unturnedPlayer == null) return;
+
+            byte[] state = equipment.state;
+            if (state == null || state.Length < 8)
+            {
+                return;
+            }
+
+            ulong keyGuid = BitConverter.ToUInt64(state, 0);
+            if (!Main.IsOurGUID(keyGuid))
+            {
+                return;
+            }
+
+            Vector3 origin = player.look.aim.position - player.look.aim.forward * 0.5f;
+            Vector3 direction = player.look.aim.forward;
+            float distance = 4f;
+            int layerMask = RayMasks.VEHICLE;
+
+            RaycastHit hit;
+            bool hitVehicle = Physics.Raycast(origin, direction, out hit, distance, layerMask);
+            InteractableVehicle targetVehicle = null;
+            bool isRemote = false;
+
+            if (hitVehicle)
+            {
+                targetVehicle = hit.transform.GetComponent<InteractableVehicle>();
+            }
+
+            if (targetVehicle == null)
+            {
+                float searchRadius = 25f;
+                Vector3 playerPos = player.transform.position;
+                float closestDist = searchRadius + 1f;
+                InteractableVehicle closestVehicle = null;
+
+                foreach (var vehicle in VehicleManager.vehicles)
+                {
+                    ulong vGuid = 0;
+                    if (Main.IsOurGUID(vehicle.lockedOwner.m_SteamID))
+                    {
+                        vGuid = vehicle.lockedOwner.m_SteamID;
+                    }
+                    else if (Main.IsOurGUID(vehicle.lockedGroup.m_SteamID))
+                    {
+                        vGuid = vehicle.lockedGroup.m_SteamID;
+                    }
+
+                    if (vGuid != keyGuid)
+                    {
+                        ulong dbGuid = Main.Instance.FindGuidByInstanceID((int)vehicle.instanceID);
+                        if (dbGuid != keyGuid) continue;
+                    }
+
+                    float dist = Vector3.Distance(playerPos, vehicle.transform.position);
+                    if (dist < closestDist)
+                    {
+                        closestDist = dist;
+                        closestVehicle = vehicle;
                     }
                 }
 
-                // Обнуляем батарею на сервере
-                __instance.batteryCharge = 0;
-                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
-
-                // Если батарея была — подменяем на сохранённое значение
-                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                if (closestVehicle != null)
                 {
-                    __instance.batteryCharge = lastBattery;
-                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
+                    targetVehicle = closestVehicle;
+                    isRemote = true;
+                }
+                else
+                {
+                    Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, "Транспорт не в зоне действия ключа!");
+                    return;
                 }
             }
-        }
-    }
 
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("checkEnter", new Type[] { typeof(CSteamID), typeof(CSteamID) })]
-    internal class Patch_BatteryOnCheckEnter
-    {
-        private static void Postfix(InteractableVehicle __instance, ref bool __result)
-        {
-            if (__instance == null) return;
+            if (targetVehicle == null) return;
 
-            if (__instance.health == 1 && __instance.batteryCharge > 0)
+            bool hasFreeSeat = false;
+            if (targetVehicle.passengers != null)
             {
-                Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
-                __instance.batteryCharge = 0;
-                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("addPlayer")]
-    internal class Patch_RestoreBatteryOnEnter
-    {
-        private static void Prefix(InteractableVehicle __instance, byte seatIndex, CSteamID steamID)
-        {
-            if (__instance == null) return;
-
-            // Восстанавливаем батарею, когда игрок сел в машину
-            if (seatIndex == 0 && __instance.health == 1)
-            {
-                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                for (byte i = 0; i < targetVehicle.passengers.Length; i++)
                 {
-                    __instance.batteryCharge = lastBattery;
-                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
-                    Main.LastBatteryValues.Remove(__instance.instanceID);
-                }
-            }
-        }
-    }
-
-    // 3 ТРЕТЬЯ ЛОГИКА: При пересадке на водительское место в разбитой машине
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("swapPlayer")]
-    internal class Patch_BatteryOnSwap
-    {
-        private static void Prefix(InteractableVehicle __instance, byte fromSeatIndex, byte toSeatIndex)
-        {
-            if (__instance == null) return;
-
-            // Только для разбитых машин (HP = 1)
-            if (__instance.health == 1)
-            {
-                // Если игрок пересаживается на пассажирское место (toSeatIndex > 0)
-                if (toSeatIndex > 0)
-                {
-                    // Сохраняем батарею (если есть)
-                    if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                    if (targetVehicle.passengers[i].player == null)
                     {
-                        Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                        hasFreeSeat = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!hasFreeSeat)
+            {
+                Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, "В этом транспорте нет свободных мест!");
+                return;
+            }
+
+            ulong vehicleGuid = 0;
+            if (Main.IsOurGUID(targetVehicle.lockedOwner.m_SteamID))
+            {
+                vehicleGuid = targetVehicle.lockedOwner.m_SteamID;
+            }
+            else if (Main.IsOurGUID(targetVehicle.lockedGroup.m_SteamID))
+            {
+                vehicleGuid = targetVehicle.lockedGroup.m_SteamID;
+            }
+
+            if (vehicleGuid == 0)
+            {
+                vehicleGuid = Main.Instance.FindGuidByInstanceID((int)targetVehicle.instanceID);
+            }
+
+            if (vehicleGuid != 0)
+            {
+                if (vehicleGuid != keyGuid)
+                {
+                    Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, "Этот ключ не подходит к этому транспорту!");
+                    return;
+                }
+
+                string steamId = steamID.ToString();
+                VehicleData vehicleData = Main.Database.LoadVehicle(vehicleGuid);
+
+                if (vehicleData != null)
+                {
+                    bool keyExists = false;
+                    foreach (var keyData in vehicleData.keys)
+                    {
+                        if (keyData.state == vehicleGuid)
+                        {
+                            keyExists = true;
+                            break;
+                        }
                     }
 
-                    // Обнуляем батарею (пассажир не должен запускать двигатель)
-                    __instance.batteryCharge = 0;
-                    VehicleManager.sendVehicleBatteryCharge(__instance, 0);
-                }
-                // Если игрок пересаживается на водительское место (toSeatIndex == 0)
-                else if (toSeatIndex == 0)
-                {
-                    // Восстанавливаем батарею (водитель может запустить двигатель)
-                    if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
+                    if (!keyExists)
                     {
-                        __instance.batteryCharge = lastBattery;
-                        VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
-                        Main.LastBatteryValues.Remove(__instance.instanceID);
+                        vehicleData.keys.Add(new KeyData
+                        {
+                            ID = itemId,
+                            Owner = steamId,
+                            state = vehicleGuid
+                        });
+                        Main.Database.SaveVehicle(vehicleData);
+                    }
+                }
+
+                bool isLocked = Main.IsOurGUID(targetVehicle.lockedOwner.m_SteamID) || Main.IsOurGUID(targetVehicle.lockedGroup.m_SteamID);
+
+                if (isRemote)
+                {
+                    string vehicleName = targetVehicle.asset?.FriendlyName ?? "Транспорт";
+
+                    if (isLocked)
+                    {
+                        VehicleManager.ServerSetVehicleLock(targetVehicle, CSteamID.Nil, CSteamID.Nil, false);
+                        Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, $"{vehicleName} открыт дистанционно!");
+                        PlayEffect(targetVehicle, 58461);
                     }
                     else
                     {
-                        __instance.batteryCharge = 0;
-                        VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+                        VehicleManager.ServerSetVehicleLock(targetVehicle, new CSteamID(vehicleGuid), new CSteamID(vehicleGuid), true);
+                        Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, $"{vehicleName} закрыт дистанционно!");
+                        PlayEffect(targetVehicle, 58460);
                     }
                 }
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("tellHealth")]
-    internal class Patch_BlockOnHealthChange
-    {
-        private static void Postfix(InteractableVehicle __instance)
-        {
-            if (__instance == null) return;
-
-            // Если здоровье стало 1, блокируем управление
-            if (__instance.health == 1)
-            {
-                // Сохраняем батарею (если есть)
-                if (__instance.ContainsBatteryItem && __instance.batteryCharge > 0)
+                else
                 {
-                    Main.LastBatteryValues[__instance.instanceID] = __instance.batteryCharge;
+                    if (!isLocked)
+                    {
+                        VehicleManager.ServerSetVehicleLock(targetVehicle, new CSteamID(vehicleGuid), new CSteamID(vehicleGuid), true);
+                    }
+
+                    TryEnterVehicle(targetVehicle, unturnedPlayer);
                 }
 
-                // Обнуляем батарею (двигатель глохнет)
-                __instance.batteryCharge = 0;
-                VehicleManager.sendVehicleBatteryCharge(__instance, 0);
+                return;
+            }
 
-                // Восстанавливаем батарею (UI не видит 0)
-                if (Main.LastBatteryValues.TryGetValue(__instance.instanceID, out ushort lastBattery))
-                {
-                    __instance.batteryCharge = lastBattery;
-                    VehicleManager.sendVehicleBatteryCharge(__instance, lastBattery);
-                }
+            if (vehicleGuid == 0)
+            {
+                Rocket.Unturned.Chat.UnturnedChat.Say(unturnedPlayer, "Этот транспорт не имеет ключа!");
             }
         }
-    }
 
-    // 3. ОЧИСТКА: Если батарею украли — удаляем сохранённое значение
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("stealBattery")]
-    internal class Patch_OnBatteryStolen
-    {
-        private static void Prefix(InteractableVehicle __instance)
+        private static void TryEnterVehicle(InteractableVehicle vehicle, UnturnedPlayer player)
         {
-            if (__instance != null && Main.LastBatteryValues.ContainsKey(__instance.instanceID))
+            if (vehicle == null || player == null) return;
+
+            if (vehicle.passengers == null || vehicle.passengers.Length == 0)
             {
-                Main.LastBatteryValues.Remove(__instance.instanceID);
+                return;
             }
+
+            VehicleManager.ServerForcePassengerIntoVehicle(player.Player, vehicle);
         }
-    }
 
-    // 4. ОЧИСТКА: При удалении машины
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("OnDestroy")]
-    internal class Patch_CleanBatteryData
-    {
-        private static void Prefix(InteractableVehicle __instance)
+        private static void PlayEffect(InteractableVehicle vehicle, ushort effectID)
         {
-            if (__instance != null && Main.LastBatteryValues.ContainsKey(__instance.instanceID))
-            {
-                Main.LastBatteryValues.Remove(__instance.instanceID);
-            }
-        }
-    }
+            if (vehicle == null) return;
 
-    // Блокировка звука запуска двигателя при HP = 1
-    [HarmonyPatch(typeof(InteractableVehicle))]
-    [HarmonyPatch("PlayIgnitionSound")]
-    internal class Patch_BlockIgnitionSound
-    {
-        private static bool Prefix(InteractableVehicle __instance)
-        {
-            if (__instance != null && __instance.health == 1)
+            EffectAsset effect = Assets.find(EAssetType.EFFECT, effectID) as EffectAsset;
+            if (effect != null)
             {
-                return false;
+                TriggerEffectParameters parameters = new TriggerEffectParameters(effect);
+                parameters.position = vehicle.transform.position;
+                parameters.relevantDistance = EffectManager.MEDIUM;
+                parameters.reliable = true;
+                EffectManager.triggerEffect(parameters);
             }
-            return true;
         }
     }
 }
